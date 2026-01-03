@@ -67,7 +67,7 @@ flowchart TB
         SaveModel --> ModelPerfDB[(model_performance_logs)]
         
         %% Online serving logs analytics
-        OnlineServing([Online Serving<br/>FastAPI]) -.->|Log every serve| RecLogs
+        OnlineServing([Nginx Gateway<br/>+ FastAPI]) -.->|Log every serve| RecLogs
         UserActions([User Actions<br/>on recommendations]) -.->|Track feedback| RecFeedback
     end
     

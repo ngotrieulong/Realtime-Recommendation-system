@@ -7,7 +7,7 @@ graph TB
     subgraph OnlineHot["🔥 ONLINE LAYER (Hot Data)"]
         direction TB
         
-        Movies[(movies<br/>────────<br/>Embeddings<br/>Metadata)]
+        Movies[(movies<br/>────────<br/>Embeddings<br/>Metadata<br/>Poster URL)]
         
         UserProfiles[(user_profiles<br/>────────<br/>preference_vector<br/>total_interactions)]
         

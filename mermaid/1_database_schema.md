@@ -7,6 +7,7 @@ erDiagram
         varchar movie_id PK
         varchar title
         text description
+        varchar poster_url
         vector_768 embedding "ML embedding"
         jsonb genres
         integer release_year

@@ -21,7 +21,19 @@ flowchart TB
             BatchRecs[(batch_recommendations<br/>Pre-computed daily)]
         end
         
-        User([👤 User Request<br/>GET /recommendations]) --> FastAPI{FastAPI Server}
+        subgraph CLIENT["🖥️ CLIENT LAYER"]
+            direction TB
+            User([👤 User Request])
+            React["⚛️ React Frontend<br/>(Port 3000)"]
+        end
+
+        subgraph GATEWAY["🛡️ GATEWAY LAYER (Port 80)"]
+            Nginx["🌐 NGINX API Gateway<br/>Rate Limiting, Security, Routing"]
+        end
+
+        User --> React
+        React -->|GET /api/recommendations| Nginx
+        Nginx -->|Proxy| FastAPI{FastAPI Server}
         
         FastAPI -->|1. Check cache| Redis
         Redis -->|Hit: < 5ms| FastAPI
