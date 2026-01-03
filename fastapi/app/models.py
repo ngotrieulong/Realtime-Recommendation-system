@@ -9,3 +9,5 @@ class MovieRecommendationResponse(BaseModel):
     movie_id: int
     title: str
     score: float
+    poster_url: Optional[str] = None
+

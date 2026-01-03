@@ -61,6 +61,7 @@ class MovieRecommendation(BaseModel):
     """Single movie recommendation"""
     movie_id: str
     title: str
+    poster_url: Optional[str] = None
     score: float
     source: str  # 'batch', 'realtime', or 'hybrid'
 
@@ -201,6 +202,7 @@ async def compute_realtime_recommendations(user_id: str, limit: int = 50) -> Lis
         SELECT 
             movie_id,
             title,
+            poster_url,
             1 - (embedding <=> $1::vector) AS similarity_score
         FROM movies
         WHERE movie_id != ALL($2::varchar[])
@@ -220,6 +222,7 @@ async def compute_realtime_recommendations(user_id: str, limit: int = 50) -> Lis
         {
             "movie_id": row['movie_id'],
             "title": row['title'],
+            "poster_url": row['poster_url'],
             "score": float(row['similarity_score'])
         }
         for row in similar_movies
@@ -252,6 +255,7 @@ async def blend_recommendations(
         scores[movie_id] = {
             'movie_id': movie_id,
             'title': rec.get('title', ''),
+            'poster_url': rec.get('poster_url'),
             'score': rec['score'] * BATCH_WEIGHT,
             'batch_score': rec['score'],
             'realtime_score': 0.0
@@ -270,6 +274,7 @@ async def blend_recommendations(
             scores[movie_id] = {
                 'movie_id': movie_id,
                 'title': rec.get('title', ''),
+                'poster_url': rec.get('poster_url'),
                 'score': rec['score'] * REALTIME_WEIGHT,
                 'batch_score': 0.0,
                 'realtime_score': rec['score']
@@ -579,6 +584,7 @@ async def get_recommendations(
             MovieRecommendation(
                 movie_id=rec['movie_id'],
                 title=rec.get('title', ''),
+                poster_url=rec.get('poster_url'),
                 score=rec['score'],
                 source=rec.get('source', algorithm_source)
             )
@@ -680,7 +686,7 @@ async def get_movies(
     if genre:
         query = """
             SELECT movie_id, title, description, genres, release_year, 
-                   director, avg_rating, total_ratings
+                   director, poster_url, avg_rating, total_ratings
             FROM movies
             WHERE genres @> $1::jsonb
             ORDER BY total_ratings DESC, avg_rating DESC
@@ -690,7 +696,7 @@ async def get_movies(
     else:
         query = """
             SELECT movie_id, title, description, genres, release_year,
-                   director, avg_rating, total_ratings
+                   director, poster_url, avg_rating, total_ratings
             FROM movies
             ORDER BY total_ratings DESC, avg_rating DESC
             LIMIT $1 OFFSET $2
@@ -703,6 +709,7 @@ async def get_movies(
             "movie_id": row['movie_id'],
             "title": row['title'],
             "description": row['description'],
+            "poster_url": row['poster_url'],
             "genres": json.loads(row['genres']) if isinstance(row['genres'], str) else row['genres'],
             "release_year": row['release_year'],
             "director": row['director'],

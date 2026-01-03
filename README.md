@@ -211,19 +211,6 @@ A complete, production-ready movie recommendation system implementing Lambda Arc
 6.  **T=110ms | User's Browser**:
     *   Response received and UI renders.
 
-### Gateway Benefits Illustrated
-
-**Without Gateway (Before)**:
-*   ❌ Frontend knows all backend URLs
-*   ❌ Each service handles CORS independently
-*   ❌ No centralized rate limiting
-*   ❌ Security risk (all ports exposed)
-
-**With Gateway (After)**:
-*   ✅ Single URL (http://localhost)
-*   ✅ Rate limiting & Logging
-*   ✅ CORS centralized
-*   ✅ Security headers & Compression
 
 ### Port Mapping with Gateway
 

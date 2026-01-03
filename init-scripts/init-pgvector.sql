@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS movies (
     release_year        INTEGER,
     director            VARCHAR(200),
     actors              JSONB,
+    poster_url          VARCHAR(1000), -- URL to movie poster image
     avg_rating          FLOAT DEFAULT 0.0,
     total_ratings       INTEGER DEFAULT 0,
     

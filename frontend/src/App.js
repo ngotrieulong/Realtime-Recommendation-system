@@ -6,7 +6,9 @@
  */
 
 import React, { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
 import './App.css';
+import { MOCK_MOVIES, MOCK_METRICS } from './mockData';
 
 // API Configuration
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
@@ -14,12 +16,36 @@ const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 // =============================================================================
 // API SERVICE - Communication with Backend
 // =============================================================================
+
+
+// Toggle between Mock and Real API
+const USE_MOCK_API = true;
+
+// =============================================================================
+// API SERVICE - Communication with Backend (or Mock)
+// =============================================================================
 class RecommendationAPI {
 
     /**
      * Get personalized recommendations for a user
      */
     static async getRecommendations(userId, sessionId = null) {
+        if (USE_MOCK_API) {
+            // Simulate network delay
+            await new Promise(resolve => setTimeout(resolve, 800));
+            return {
+                user_id: userId,
+                recommendations: MOCK_MOVIES,
+                metadata: {
+                    source: 'hybrid',
+                    cached: false,
+                    computation_time_ms: 45,
+                    rec_log_id: 12345,
+                    model_version: 'mock_v1'
+                }
+            };
+        }
+
         const params = new URLSearchParams({ user_id: userId });
         if (sessionId) params.append('session_id', sessionId);
 
@@ -36,6 +62,11 @@ class RecommendationAPI {
      * Track user interaction event
      */
     static async trackEvent(eventData) {
+        if (USE_MOCK_API) {
+            console.log("📝 [MOCK] Event Tracked:", eventData);
+            return { status: "accepted", message: "Mock event tracked" };
+        }
+
         const response = await fetch(`${API_BASE_URL}/api/events`, {
             method: 'POST',
             headers: {
@@ -55,7 +86,16 @@ class RecommendationAPI {
      * Get all movies (browse catalog)
      */
     static async getMovies(limit = 50) {
-        // Note: You'll need to add this endpoint to FastAPI
+        if (USE_MOCK_API) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            return {
+                movies: MOCK_MOVIES,
+                count: MOCK_MOVIES.length,
+                limit: limit,
+                offset: 0
+            }
+        }
+
         const response = await fetch(`${API_BASE_URL}/api/movies?limit=${limit}`);
 
         if (!response.ok) {
@@ -69,6 +109,11 @@ class RecommendationAPI {
      * Get system metrics
      */
     static async getMetrics() {
+        if (USE_MOCK_API) {
+            await new Promise(resolve => setTimeout(resolve, 300));
+            return MOCK_METRICS;
+        }
+
         const response = await fetch(`${API_BASE_URL}/api/metrics`);
 
         if (!response.ok) {
@@ -114,6 +159,10 @@ function MovieCard({ movie, onInteraction, isRecommended = false, position = nul
                 <img
                     src={movie.poster_url || `https://via.placeholder.com/300x450?text=${movie.title}`}
                     alt={movie.title}
+                    onError={(e) => {
+                        e.target.onerror = null;
+                        e.target.src = `https://via.placeholder.com/300x450?text=${movie.title}`;
+                    }}
                 />
 
                 {/* Recommendation Badge */}
@@ -371,53 +420,34 @@ function App() {
         return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     });
 
-    const [currentView, setCurrentView] = useState('recommendations'); // recommendations | analytics
-
     return (
-        <div className="App">
-            {/* Header */}
-            <header className="app-header">
-                <h1>🎬 MovieRec AI</h1>
-                <div className="user-info">
-                    User: <code>{userId}</code>
-                </div>
+        <Router>
+            <div className="App">
+                {/* Header */}
+                <header className="app-header">
+                    <div className="header-content">
+                        <h1>🎬 MovieRec AI</h1>
+                        <nav className="app-nav">
+                            <Link to="/" className="nav-link">🎬 Recommendations</Link>
+                            <Link to="/analytics" className="nav-link">📊 Analytics</Link>
+                        </nav>
+                    </div>
+                </header>
 
-                {/* Navigation */}
-                <nav className="app-nav">
-                    <button
-                        className={currentView === 'recommendations' ? 'active' : ''}
-                        onClick={() => setCurrentView('recommendations')}
-                    >
-                        🎬 Recommendations
-                    </button>
-                    <button
-                        className={currentView === 'analytics' ? 'active' : ''}
-                        onClick={() => setCurrentView('analytics')}
-                    >
-                        📊 Analytics
-                    </button>
-                </nav>
-            </header>
+                {/* Main Content */}
+                <main className="app-main">
+                    <Routes>
+                        <Route path="/" element={<RecommendationPanel userId={userId} sessionId={sessionId} />} />
+                        <Route path="/analytics" element={<AnalyticsDashboard />} />
+                    </Routes>
+                </main>
 
-            {/* Main Content */}
-            <main className="app-main">
-                {currentView === 'recommendations' ? (
-                    <RecommendationPanel userId={userId} sessionId={sessionId} />
-                ) : (
-                    <AnalyticsDashboard />
-                )}
-            </main>
-
-            {/* Footer */}
-            <footer className="app-footer">
-                <p>Powered by Lambda Architecture (Batch + Real-time)</p>
-                <p>
-                    <a href={`${API_BASE_URL}/docs`} target="_blank" rel="noopener noreferrer">
-                        API Docs
-                    </a>
-                </p>
-            </footer>
-        </div>
+                {/* Footer */}
+                <footer className="app-footer">
+                    <p>Powered by Lambda Architecture (Batch + Real-time)</p>
+                </footer>
+            </div>
+        </Router>
     );
 }
 
