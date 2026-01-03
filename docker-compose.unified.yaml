@@ -1,0 +1,579 @@
+version: '3.8'
+
+# =============================================================================
+# UNIFIED LAKEHOUSE ARCHITECTURE - BATCH + REAL-TIME LAYERS
+# =============================================================================
+# Production-Ready Configuration for Airflow 3.1.5 + Spark 3.5.3
+#
+# Architecture:
+#   - Batch Layer: Airflow + Spark Batch Processing
+#   - Real-Time Layer: Kafka + Spark Streaming + Redis
+#   - Storage: MinIO (S3) + PostgreSQL (with pgvector) + Redis
+#   - API: FastAPI for serving recommendations
+#
+# Resource Budget (8GB Docker limit on Mac M4 16GB):
+#   STORAGE & DATABASE:
+#   - Postgres:        512MB (metadata + application data)
+#   - MinIO:           512MB (object storage)
+#   - Redis:           256MB (cache)
+#   
+#   MESSAGING:
+#   - Zookeeper:       256MB (Kafka coordinator)
+#   - Kafka:           768MB (message broker)
+#   
+#   PROCESSING:
+#   - Spark Master:    256MB (cluster coordinator)
+#   - Spark Worker:    1.5GB (shared for batch + streaming)
+#   
+#   ORCHESTRATION:
+#   - Airflow Web:     512MB (UI + API)
+#   - Airflow Sch:     512MB (scheduler)
+#   
+#   API:
+#   - FastAPI:         256MB (recommendation API)
+#   
+#   Total:            ~5.3GB (2.7GB buffer for system overhead)
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    # Core configuration
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Ho_Chi_Minh
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    
+    # Database connection
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE: 10
+    AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW: 20
+    AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_RECYCLE: 1800
+    
+    # Security (Fernet key for encrypting connections/variables)
+    AIRFLOW__CORE__FERNET_KEY: '46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho='
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'airflow-secret-key-change-in-production'
+    
+    # Webserver security (Airflow 3.x defaults)
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'false'
+    AIRFLOW__WEBSERVER__EXPOSE_HOSTNAME: 'false'
+    AIRFLOW__WEBSERVER__EXPOSE_STACKTRACE: 'false'
+    
+    # Performance tuning
+    AIRFLOW__CORE__PARALLELISM: 32
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 16
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 16
+    AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY: 256
+    AIRFLOW__SCHEDULER__USE_JOB_SCHEDULE: 'true'
+    
+    # Connections (can be overridden via Airflow UI)
+    AIRFLOW_CONN_SPARK_DEFAULT: 'spark://spark-master:7077'
+    AIRFLOW_CONN_AWS_DEFAULT: 'aws://minioadmin:minioadmin@?host=http://minio:9000&region_name=us-east-1'
+    
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark-jobs:/opt/spark-jobs:ro
+    - airflow-logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+  networks:
+    - lakehouse-network
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  # ===========================================================================
+  # STORAGE LAYER: MinIO (S3-compatible Object Storage)
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: minio
+    hostname: minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:9001
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Web Console
+    volumes:
+      - minio-data:/data
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-12-18T16-13-30Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo '🏗️  Setting up MinIO buckets...';
+      mc alias set minio http://minio:9000 minioadmin minioadmin;
+      mc mb minio/lakehouse --ignore-existing;
+      mc mb minio/raw-events --ignore-existing;
+      mc mb minio/processed-data --ignore-existing;
+      mc mb minio/checkpoints --ignore-existing;
+      mc mb minio/models --ignore-existing;
+      mc mb minio/logs --ignore-existing;
+      echo '✅ Buckets created successfully';
+      echo '📊 Listing all buckets:';
+      mc ls minio;
+      "
+    networks:
+      - lakehouse-network
+
+  # ===========================================================================
+  # DATABASE LAYER: PostgreSQL with pgvector
+  # ===========================================================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.UTF-8"
+      # Performance tuning
+      POSTGRES_MAX_CONNECTIONS: 150
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 512MB
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # CACHE LAYER: Redis (for real-time recommendations)
+  # ===========================================================================
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    hostname: redis
+    command: >
+      redis-server
+      --maxmemory 200mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ===========================================================================
+  # MESSAGE BROKER: Apache Kafka + Zookeeper
+  # ===========================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    hostname: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+      KAFKA_HEAP_OPTS: "-Xmx256m -Xms128m"
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Listeners for Docker networking
+      KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka:29092,OUTSIDE://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
+      # Topic defaults
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      # Retention (7 days)
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+      # Performance tuning
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+      # Offset management
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    ports:
+      - "8081:8080"
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+    restart: unless-stopped
+
+  # ===========================================================================
+  # PROCESSING LAYER: Apache Spark Cluster
+  # ===========================================================================
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8088
+      SPARK_NO_DAEMONIZE: 'true'
+      SPARK_LOG_LEVEL: INFO
+    ports:
+      - "7077:7077"
+      - "8088:8088"
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs:ro
+      - spark-logs:/opt/spark/logs
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    hostname: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1536m
+      SPARK_WORKER_PORT: 8881
+      SPARK_WORKER_WEBUI_PORT: 8089
+      SPARK_NO_DAEMONIZE: 'true'
+      SPARK_LOG_LEVEL: INFO
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs:ro
+      - spark-logs:/opt/spark/logs
+      - spark-temp:/tmp/spark
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+          cpus: '2.0'
+        reservations:
+          memory: 768M
+    restart: unless-stopped
+
+  # ===========================================================================
+  # ORCHESTRATION LAYER: Apache Airflow 3.1.5
+  # ===========================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    hostname: airflow-webserver
+    environment:
+      <<: *airflow-common-env
+      # Auto-initialization
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    command: webserver
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    hostname: airflow-scheduler
+    environment:
+      <<: *airflow-common-env
+      # Scheduler-specific settings
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 30
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 60
+      AIRFLOW__SCHEDULER__PARSING_PROCESSES: 2
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+    command: scheduler
+    restart: unless-stopped
+
+  # ===========================================================================
+  # API LAYER: FastAPI (Real-time serving)
+  # ===========================================================================
+  fastapi:
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile
+    container_name: fastapi
+    hostname: fastapi
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      # Database connections
+      DATABASE_URL: postgresql://airflow:airflow@postgres:5432/moviedb
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Application settings
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      # CORS (adjust for production)
+      CORS_ORIGINS: "*"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./fastapi/app:/app
+    networks:
+      - lakehouse-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  # ===========================================================================
+  # GATEWAY LAYER: Nginx API Gateway
+  # ===========================================================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - fastapi
+      - airflow-webserver
+      - minio
+    networks:
+      - lakehouse-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===========================================================================
+  # FRONTEND LAYER: React App
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:80
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - lakehouse-network
+    depends_on:
+      - nginx
+
+# =============================================================================
+# VOLUMES: Persistent storage
+# =============================================================================
+volumes:
+  minio-data:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  zookeeper-data:
+    driver: local
+  zookeeper-logs:
+    driver: local
+  kafka-data:
+    driver: local
+  spark-logs:
+    driver: local
+  spark-temp:
+    driver: local
+  airflow-logs:
+    driver: local
+  nginx-logs:
+    driver: local
+
+# =============================================================================
+# NETWORKS: Unified internal network
+# =============================================================================
+networks:
+  lakehouse-network:
+    driver: bridge
+    name: lakehouse-network
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/16
