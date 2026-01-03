@@ -409,65 +409,143 @@ See `.env.example` for full list of options.
 
 ---
 
-## 📖 Usage Examples
+## 📡 API Reference
 
-### Send User Interaction Event
+### Endpoints
 
-```bash
-# User clicks on "Inception"
-curl -X POST http://localhost/api/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "user_123",
-    "movie_id": "m002",
-    "event_type": "click"
-  }'
+#### `GET /api/recommendations`
+Get personalized movie recommendations for a user (Hybrid: Batch + Real-time).
 
-# Response: {"status":"accepted","message":"Event queued for processing"}
+**Request Parameters:**
+- `user_id` (str): Unique user identifier
+- `limit` (int): Number of recommendations (default: 10)
+
+**Response:**
+```json
+{
+  "user_id": "user_123",
+  "recommendations": [
+    {
+      "movie_id": "m_inception",
+      "title": "Inception",
+      "score": 0.98,
+      "poster_url": "https://upload.wikimedia..."
+    }
+  ],
+  "source": "hybrid",
+  "latency_ms": 45
+}
 ```
 
-### Get Recommendations
+#### `POST /api/events`
+Track user interaction events (clicks, ratings, watches) for processing.
 
-```bash
-# Get top 10 recommendations for user
-curl "http://localhost/api/recommendations?user_id=user_123&limit=10"
-
-# Response:
-# {
-#   "user_id": "user_123",
-#   "recommendations": [
-#     {"movie_id":"m003","title":"Interstellar","score":0.94},
-#     ...
-#   ],
-#   "source": "redis_cache",
-#   "generated_at": "2025-01-01T00:00:00Z"
-# }
+**Request Body:**
+```json
+{
+  "user_id": "user_123",
+  "movie_id": "m_inception",
+  "event_type": "rate",
+  "value": 5
+}
 ```
 
-### Start Spark Streaming Job
-
-```bash
-# Submit streaming job to Spark cluster
-docker exec -it spark-master \
-  /opt/spark/bin/spark-submit \
-  --master spark://spark-master:7077 \
-  --deploy-mode client \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 \
-  /opt/spark-jobs/streaming_recommendations.py
-
-# Monitor in Spark UI: http://localhost:8088
+**Response:**
+```json
+{
+  "status": "accepted",
+  "message": "Event queued for processing"
+}
 ```
 
-### Trigger Airflow DAG
+#### `GET /api/movies`
+Browse the movie catalog with genre filtering.
 
-```bash
-# Via CLI
-docker exec -it airflow-webserver \
-  airflow dags trigger batch_recommendation_processing
+**Request Parameters:**
+- `limit` (int): Items per page
+- `offset` (int): Pagination offset
+- `genre` (str): Filter by genre (optional)
 
-# Or via UI: http://localhost/admin
-# Navigate to DAGs → batch_recommendation_processing → Trigger DAG
+**Response:**
+```json
+{
+  "movies": [...],
+  "count": 50,
+  "limit": 50
+}
 ```
+
+#### `GET /health`
+Basic health check for load balancers.
+
+**Response:** `{"status": "healthy"}`
+
+---
+
+## 🔧 Feature Engineering
+
+### Feature Categories
+The system generates features across two distinct timelines (Batch & Real-time):
+
+| Category | Window | Features | Description |
+|----------|--------|----------|-------------|
+| **Movie Stats** | Batch (Daily) | `avg_rating`, `total_ratings`, `genre_dist` | Long-term popularity metrics |
+| **User Profile** | Batch (Daily) | `fav_genres`, `view_count`, `avg_given_rating` | User's historical preferences |
+| **Real-time Context** | Stream (5s) | `current_session_clicks`, `recent_genre_affinity` | Immediate user intent signals |
+| **Content Embeddings** | Static | `bert_embedding` (768d) | Semantic vector from overview |
+
+### Feature Generation
+Features are computed/stored in three places:
+
+1.  **Postgres (`movies` table)**: Static metadata and batch statistics.
+2.  **Redis (Cache)**: Real-time session context and recency signals.
+3.  **pgvector**: Vector embeddings for semantic similarity search.
+
+```python
+# Example: Hybrid Feature Combination
+combined_score = (
+    (batch_cf_score * 0.7) +       # Long-term preference (ALS)
+    (realtime_content_score * 0.3) # Short-term intent (Vector Sim)
+)
+```
+
+---
+
+## 🎓 Model Training
+
+### Training Pipeline
+The ML pipeline (`dags/model_training_dag.py`) executes nightly:
+
+1.  **Data Extraction**: Spark reads raw events from `archived-events/`.
+2.  **Preprocessing**: Filters outliers and normalizes ratings.
+3.  **Model Training**: Trains an **ALS (Alternating Least Squares)** matrix factorization model.
+    *   *Implicit Feedback*: Uses views/clicks as confidence.
+    *   *Explicit Feedback*: Uses ratings as targets.
+4.  **Evaluation**: Calculates RMSE and Precision@K on a holdout set.
+5.  **Model Register**: Saves user/item factors to Postgres for serving.
+
+### Model Selection
+We primarily use **Matrix Factorization** for the Batch Layer due to its scalability:
+
+```python
+# Spark ALS Configuration
+als = ALS(
+    maxIter=10,
+    regParam=0.1,
+    userCol="user_id_int",
+    itemCol="movie_id_int",
+    ratingCol="rating",
+    coldStartStrategy="drop"
+)
+```
+
+### Evaluation Metrics
+
+| Metric | Definition | Target |
+|--------|------------|--------|
+| **RMSE** | Root Mean Square Error of rating prediction | < 0.8 |
+| **Precision@K** | % of relevant items in top-K recs | > 0.15 |
+| **Coverage** | % of total catalog recommended to at least 1 user | > 80% |
 
 ---
 
