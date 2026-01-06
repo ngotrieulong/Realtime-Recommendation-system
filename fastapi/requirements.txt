@@ -4,3 +4,11 @@ pydantic
 sqlalchemy
 psycopg2-binary
 pgvector
+asyncpg
+aiokafka
+redis
+slowapi
+prometheus-fastapi-instrumentator
+python-multipart
+passlib[bcrypt]
+python-jose[cryptography]
