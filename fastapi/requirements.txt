@@ -10,5 +10,10 @@ redis
 slowapi
 prometheus-fastapi-instrumentator
 python-multipart
-passlib[bcrypt]
+passlib[argon2]
 python-jose[cryptography]
+pytest
+httpx
+pytest-asyncio
+pytest-mock
+email-validator
